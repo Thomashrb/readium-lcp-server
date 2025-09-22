@@ -8,9 +8,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +22,7 @@ import (
 	"github.com/jtacoma/uritemplates"
 	"github.com/readium/readium-lcp-server/api"
 	"github.com/readium/readium-lcp-server/config"
+	"github.com/readium/readium-lcp-server/index"
 	apilcp "github.com/readium/readium-lcp-server/lcpserver/api"
 	"github.com/readium/readium-lcp-server/license"
 	licensestatuses "github.com/readium/readium-lcp-server/license_statuses"
@@ -344,6 +348,54 @@ func LendingReturn(w http.ResponseWriter, r *http.Request, s Server) {
 	}
 }
 
+func externalCheck(userId string, releaseId string, licenseId string) bool {
+	accessCheckUser := os.Getenv("READIUM_LSDSERVER_REMOTE_CHECK_USER")
+	accessCheckPass := os.Getenv("READIUM_LSDSERVER_REMOTE_CHECK_PASS")
+	accessCheckUrlBase := os.Getenv("READIUM_LSDSERVER_REMOTE_CHECK_BASEURL")
+	if accessCheckUser == "" {
+		logging.Print("READIUM_LSDSERVER_REMOTE_CHECK_USER not found")
+		return true
+	}
+	if accessCheckPass == "" {
+		log.Print("READIUM_LSDSERVER_REMOTE_CHECK_PASS not found")
+		return true
+	}
+	if accessCheckUrlBase == "" {
+		log.Print("READIUM_LSDSERVER_REMOTE_CHECK_BASEURL not found")
+		return true
+	}
+
+	url := fmt.Sprintf("%s/releases/%s/lcp/user/%s/status", accessCheckUrlBase, releaseId, userId)
+
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+	req, err := http.NewRequest(http.MethodHead, url, nil)
+	if err != nil {
+		log.Printf("Error creating external validation request %v", err)
+		return true
+	}
+
+	req.SetBasicAuth(accessCheckUser, accessCheckPass)
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error performing external validation request: %v", err)
+		return true
+	}
+	defer resp.Body.Close()
+
+	return (199 < resp.StatusCode && resp.StatusCode < 300)
+}
+
+func internalIdFromContentId(contentId string) (string, error) {
+	pattern := regexp.MustCompile(`^[a-f0-9-]+:_release_id:(\d+)$`)
+	match := pattern.FindStringSubmatch(contentId)
+	if len(match) != 2 {
+		return "", errors.New("unexpected contentId: " + contentId + " an internal id could not be parsed from it")
+	}
+	return match[1], nil
+}
+
 // LendingRenewal checks that the calling device is registered with the license,
 // then modifies the end date associated with the license
 // and returns an updated license status to the caller.
@@ -454,6 +506,29 @@ func LendingRenewal(w http.ResponseWriter, r *http.Request, s Server) {
 		msg := "Attempt to renew with a date before the current end date"
 		problem.Error(w, r, problem.Problem{Type: problem.RENEW_REJECT, Detail: msg}, http.StatusForbidden)
 		return
+	}
+
+	lic, err := getLcpLicense(licenseID)
+	if err == nil {
+		logging.Print("Got lcp license with license id: " + licenseID + " continuing with external access check")
+		content, err := getContentInfoFromLicence(licenseID)
+		if err != nil {
+			logging.Print(err.Error())
+		} else {
+			userID := lic.User.ID
+			contentID := content.ID
+			releaseID, err := internalIdFromContentId(contentID)
+			if err != nil {
+				logging.Print(err.Error())
+			} else {
+				externalOk := externalCheck(userID, releaseID, licenseID)
+				if !externalOk {
+					lendingCancellation(licenseID, s)
+					problem.Error(w, r, problem.Problem{Type: problem.RENEW_REJECT, Detail: "External checking failed"}, http.StatusForbidden)
+					return
+				}
+			}
+		}
 	}
 
 	// add a log
@@ -610,6 +685,29 @@ func ExtendSubscription(w http.ResponseWriter, r *http.Request, s Server) {
 		msg := "Attempt to extend with a date before the current end date"
 		problem.Error(w, r, problem.Problem{Type: problem.RENEW_REJECT, Detail: msg}, http.StatusForbidden)
 		return
+	}
+
+	lic, err := getLcpLicense(licenseID)
+	if err == nil {
+		logging.Print("Got lcp license with license id: " + licenseID + " continuing with external access check")
+		content, err := getContentInfoFromLicence(licenseID)
+		if err != nil {
+			logging.Print(err.Error())
+		} else {
+			userID := lic.User.ID
+			contentID := content.ID
+			releaseID, err := internalIdFromContentId(contentID)
+			if err != nil {
+				logging.Print(err.Error())
+			} else {
+				externalOk := externalCheck(userID, releaseID, licenseID)
+				if !externalOk {
+					lendingCancellation(licenseID, s)
+					problem.Error(w, r, problem.Problem{Type: problem.RENEW_REJECT, Detail: "External checking failed"}, http.StatusForbidden)
+					return
+				}
+			}
+		}
 	}
 
 	// add a log
@@ -1219,6 +1317,147 @@ func updateLicense(timeEnd time.Time, licenseID string) (int, error) {
 
 	log.Println("Error Notifying Lcp Server of License update (" + licenseID + "):" + err.Error())
 	return 0, err
+}
+
+func getLcpLicense(licenseID string) (license.License, error) {
+	var lic license.License
+	// get the lcp server url
+	lcpBaseURL := config.Config.LcpServer.PublicBaseUrl
+	if len(lcpBaseURL) <= 0 {
+		return lic, errors.New("undefined Config.LcpServer.PublicBaseUrl")
+	}
+	lcpURL := lcpBaseURL + "/licenses/" + licenseID
+
+	req, err := http.NewRequest("GET", lcpURL, nil)
+	if err != nil {
+		return lic, fmt.Errorf("error creating lcp license request: %w", err)
+	}
+	auth := config.Config.LcpUpdateAuth
+	if auth.Username != "" {
+		req.SetBasicAuth(auth.Username, auth.Password)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return lic, fmt.Errorf("error making lcp license request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return lic, fmt.Errorf("error reading lcp license response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || 300 <= resp.StatusCode {
+		return lic, fmt.Errorf("non-2xx lcp license response: %s", resp.Status)
+	}
+
+	if err := json.Unmarshal(body, &lic); err != nil {
+		return lic, fmt.Errorf("error decoding lcp license response JSON: %w", err)
+	}
+
+	return lic, nil
+}
+
+func getContentInfoFromLicence(licenseID string) (index.Content, error) {
+	var ci index.Content
+	// get the lcp server url
+	lcpBaseURL := config.Config.LcpServer.PublicBaseUrl
+	if len(lcpBaseURL) <= 0 {
+		return ci, errors.New("undefined Config.LcpServer.PublicBaseUrl")
+	}
+	lcpURL := lcpBaseURL + "/licenses/" + licenseID + "/content"
+
+	req, err := http.NewRequest("GET", lcpURL, nil)
+	if err != nil {
+		return ci, fmt.Errorf("error creating lcp content from license id request: %w", err)
+	}
+	auth := config.Config.LcpUpdateAuth
+	if auth.Username != "" {
+		req.SetBasicAuth(auth.Username, auth.Password)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ci, fmt.Errorf("error making lcp content from license id request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ci, fmt.Errorf("error reading lcp content response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || 300 <= resp.StatusCode {
+		return ci, fmt.Errorf("non-2xx lcp content response: %s", resp.Status)
+	}
+
+	if err := json.Unmarshal(body, &ci); err != nil {
+		return ci, fmt.Errorf("error decoding lcp content response JSON: %w", err)
+	}
+
+	return ci, nil
+}
+
+func lendingCancellation(licenseID string, s Server) error {
+	logging.Print("Revoke or Cancel the License " + licenseID)
+	licenseStatus, err := s.LicenseStatuses().GetByLicenseID(licenseID)
+	if err != nil {
+		return err
+	}
+	// get the partial license status document
+	var newStatus licensestatuses.LicenseStatus
+	newStatus.Status = status.STATUS_CANCELLED
+
+	// the new expiration time is now
+	currentTime := time.Now().UTC().Truncate(time.Second)
+
+	// update the license with the new expiration time, via a call to the lcp Server
+	httpStatusCode, err := updateLicense(currentTime, licenseID)
+	if err != nil {
+		return err
+	}
+
+	if httpStatusCode != http.StatusOK && httpStatusCode != http.StatusPartialContent { // 200, 206
+		return errors.New("License update notif to lcp server failed with http code " + strconv.Itoa(httpStatusCode))
+	}
+
+	// create a cancel or revoke event
+	var st string
+	var ty int
+	if newStatus.Status == status.STATUS_CANCELLED {
+		st = status.STATUS_CANCELLED
+		ty = status.STATUS_CANCELLED_INT
+	} else {
+		st = status.STATUS_REVOKED
+		ty = status.STATUS_REVOKED_INT
+	}
+
+	// the event source is not a device.
+	deviceName := "system"
+	deviceID := "system"
+	event := makeEvent(st, deviceName, deviceID, licenseStatus.ID)
+	err = s.Transactions().Add(*event, ty)
+	if err != nil {
+		return err
+	}
+	// update the license status properties with the new status & expiration item (now)
+	// the potential end timestamp is also removed.
+	licenseStatus.Status = newStatus.Status
+	licenseStatus.CurrentEndLicense = &currentTime
+	licenseStatus.Updated.Status = &currentTime
+	licenseStatus.Updated.License = &currentTime
+	licenseStatus.PotentialRights = nil
+
+	// update the license status in db
+	err = s.LicenseStatuses().Update(*licenseStatus)
+	if err != nil {
+		return err
+	}
+
+	return err
 }
 
 // fillLicenseStatus fills the 'message' field, the 'links' and 'event' objects in the license status
